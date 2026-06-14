@@ -1,7 +1,6 @@
-import { Database } from 'duckdb-async'
+import initSqlJs from 'sql.js'
 import fs from 'fs'
 import path from 'path'
-import os from 'os'
 import { createClient } from '@/lib/supabase/server'
 import { geminiFlash } from '@/lib/gemini'
 import type { ChatPayload, ColumnDefinition, ChartConfig } from '@/types'
@@ -49,29 +48,65 @@ function prepareRows(
   })
 }
 
-// Write rows as NDJSON to a temp file, load into DuckDB in-memory, run the query.
-// DuckDB auto-detects types from NDJSON, supports full SQL: CTEs, window functions, subqueries.
-async function runDuckDBQuery(
+// Cache the sql.js init promise so the wasm is only loaded once per function instance.
+let sqlJsPromise: ReturnType<typeof initSqlJs> | null = null
+function getSqlJs() {
+  if (!sqlJsPromise) {
+    const wasmBuffer = fs.readFileSync(
+      path.join(process.cwd(), 'node_modules/sql.js/dist/sql-wasm.wasm')
+    )
+    const wasmBinary = wasmBuffer.buffer.slice(
+      wasmBuffer.byteOffset,
+      wasmBuffer.byteOffset + wasmBuffer.byteLength
+    ) as ArrayBuffer
+    sqlJsPromise = initSqlJs({ wasmBinary })
+  }
+  return sqlJsPromise
+}
+
+// Load rows into an in-memory SQLite database and execute the query.
+// sql.js is WebAssembly — no native binaries, works on Vercel and all serverless runtimes.
+async function runSQLiteQuery(
   sql: string,
-  rows: Record<string, unknown>[]
+  rows: Record<string, unknown>[],
+  columns: ColumnDefinition[]
 ): Promise<Record<string, unknown>[]> {
-  const tmpFile = path.join(os.tmpdir(), `da_${Date.now()}_${Math.random().toString(36).slice(2)}.ndjson`)
-  const duckPath = tmpFile.replace(/\\/g, '/')
+  if (rows.length === 0) return []
+
+  const SQL = await getSqlJs()
+  const db = new SQL.Database()
+
   try {
-    fs.writeFileSync(tmpFile, rows.map(r => JSON.stringify(r)).join('\n'), 'utf8')
-    const db = await Database.create(':memory:')
-    const conn = await db.connect()
-    await conn.run(`CREATE TABLE data AS SELECT * FROM read_ndjson_auto('${duckPath}')`)
-    const result = await conn.all(sql)
-    await db.close()
-    // DuckDB returns COUNT/SUM results as BigInt — convert to Number for JSON serialization
-    return (result as Record<string, unknown>[]).map(row => {
-      const out: Record<string, unknown> = {}
-      for (const [k, v] of Object.entries(row)) out[k] = typeof v === 'bigint' ? Number(v) : v
-      return out
+    const colNames = Object.keys(rows[0])
+    const colDefs = colNames.map(col => {
+      const def = columns.find(c => stripBracketAnnotation(c.original_name) === col)
+      return `"${col}" ${def?.type === 'number' ? 'REAL' : 'TEXT'}`
+    }).join(', ')
+
+    db.run(`CREATE TABLE data (${colDefs})`)
+
+    const placeholders = colNames.map(() => '?').join(', ')
+    const insertSQL = `INSERT INTO data (${colNames.map(c => `"${c}"`).join(', ')}) VALUES (${placeholders})`
+    const stmt = db.prepare(insertSQL)
+    for (const row of rows) {
+      stmt.run(colNames.map(col => {
+        const v = row[col]
+        return (v === null || v === undefined) ? null : v as string | number
+      }))
+    }
+    stmt.free()
+
+    const result = db.exec(sql)
+    if (!result || result.length === 0) return []
+
+    const { columns: cols, values } = result[0]
+    return values.map(row => {
+      const obj: Record<string, unknown> = {}
+      cols.forEach((col, i) => { obj[col] = row[i] })
+      return obj
     })
   } finally {
-    try { fs.unlinkSync(tmpFile) } catch {}
+    db.close()
   }
 }
 
@@ -196,7 +231,7 @@ export async function POST(request: Request) {
     ? `\nSample rows spread across the dataset (shows actual values — use for reference):\n${JSON.stringify(sampleRows, null, 2)}`
     : ''
 
-  const sqlSystemPrompt = `You are a SQL expert using DuckDB (full analytical SQL engine).
+  const sqlSystemPrompt = `You are a SQL expert using SQLite (via sql.js — full standard SQL engine).
 Table name: data
 Schema:
 ${schemaLines}
@@ -208,15 +243,18 @@ Rules:
 - Even if you are unsure, write a best-effort SELECT that is likely to return relevant rows
 - The sample rows are just examples; the full dataset may contain many more values not shown
 - Use exact original column names (case-sensitive) in your SQL
-- ALWAYS wrap every column name in backticks: e.g. \`Country Name\`, \`2010\`, \`Series Name\`
-- Backtick-quoting is REQUIRED for all column names — even simple ones
+- ALWAYS wrap every column name in double-quotes: e.g. "Country Name", "2010", "Series Name"
+- Double-quote-quoting is REQUIRED for all column names — even simple ones
 - The table name is always "data"
 - Write only a SELECT query — never INSERT, UPDATE, DELETE
 - CTEs (WITH clauses), window functions (ROW_NUMBER, RANK, SUM OVER, etc.), subqueries, and table aliases are fully supported — use them freely for complex analysis
 - Avoid these reserved words as aliases: count, sum, avg, total, value, index — use cnt, amount, avg_val, grand_total, num instead
-- ALWAYS use LIKE with wildcards when filtering string columns on user-provided values: e.g. \`Series Name\` LIKE '%Population%', \`Country Name\` LIKE '%Argentina%'
+- ALWAYS use LIKE with wildcards when filtering string columns on user-provided values: e.g. "Series Name" LIKE '%Population%', "Country Name" LIKE '%Argentina%'
 - Only use exact = matching if the exact string is visible in the sample rows above
-- Wide-format data (columns named as years like "2010", "2011"...): use DuckDB UNPIVOT to convert to long format for trend/time-series questions. Example: UNPIVOT data ON "2010","2011","2012" INTO NAME year VALUE amount WHERE ...
+- Wide-format data (columns named as years like "2010", "2011"...): use UNION ALL to convert to long format for trend/time-series questions. Example:
+  SELECT '2010' AS year, "entity_col", CAST("2010" AS REAL) AS value FROM data
+  UNION ALL SELECT '2011' AS year, "entity_col", CAST("2011" AS REAL) AS value FROM data
+  ORDER BY "entity_col", year
 - Always structure output to be chart-ready: for time-series use (year, value) or (year, entity, value); for comparisons use (label, value); for rankings use (rank, label, value)
 - For "combined X% of total" or "cumulative" questions: return ALL rows with the label and numeric column ordered by value DESC — do NOT filter by percentage threshold. The system applies cumulative filtering automatically.
 - LIMIT: only add a LIMIT clause when the user explicitly specifies a number (e.g. "top 5", "show 3"). For "the most" or "highest" without a number, use LIMIT 10. Never use LIMIT 1.
@@ -332,12 +370,12 @@ Rules:
       )
     )
 
-    // Strip "[YR...]" bracket annotations then convert backticks → double-quotes for DuckDB
+    // Strip "[YR...]" bracket annotations; also convert any backticks Gemini emits → double-quotes
     const normalizedSQL = sanitizeSQLIdentifiers(generatedSQL)
       .replace(/`([^`]+)`/g, '"$1"')
 
     try {
-      const rawResult = await runDuckDBQuery(normalizedSQL, flatRows)
+      const rawResult = await runSQLiteQuery(normalizedSQL, flatRows, columns)
       const nonBlank = rawResult.filter(row =>
         Object.values(row).some(v => v !== null && v !== undefined && String(v).trim() !== '')
       )
