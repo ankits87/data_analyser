@@ -4,12 +4,14 @@ import { useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { parseCSV, inferColumnTypes } from '@/lib/csv/parser'
 import { classifyErrors, type ParseIssue } from '@/lib/csv/validator'
+import { trimWhitespace } from '@/lib/cleaning'
 import CsvDropzone from './CsvDropzone'
 import ParseErrorSummary from './ParseErrorSummary'
 import ColumnReviewTable from './ColumnReviewTable'
+import CleaningStep from './CleaningStep'
 import type { ColumnDefinition } from '@/types'
 
-type Step = 'idle' | 'parsing' | 'issues' | 'enriching' | 'review' | 'saving'
+type Step = 'idle' | 'parsing' | 'issues' | 'enriching' | 'review' | 'saving' | 'cleaning'
 
 interface Props {
   onComplete: (datasetId: string) => void
@@ -28,6 +30,7 @@ export default function UploadFlow({ onComplete, onCancel }: Props) {
   const [columns, setColumns] = useState<ColumnDefinition[]>([])
   const [saveProgress, setSaveProgress] = useState(0)
   const [error, setError] = useState<string | null>(null)
+  const [savedDatasetId, setSavedDatasetId] = useState<string | null>(null)
 
   async function handleFileSelected(selectedFile: File) {
     setFile(selectedFile)
@@ -135,11 +138,15 @@ export default function UploadFlow({ onComplete, onCancel }: Props) {
       const { datasetId, error: apiError } = await res.json()
       if (apiError) throw new Error(apiError)
 
-      // 2. Insert rows in batches directly via Supabase browser client
-      const totalBatches = Math.ceil(rows.length / BATCH_SIZE)
+      // 2. Auto-trim whitespace before inserting (silent, no user action needed)
+      const trimmedRows = trimWhitespace(rows)
+      setRows(trimmedRows)
 
-      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-        const batch = rows.slice(i, i + BATCH_SIZE).map((data, j) => ({
+      // 3. Insert rows in batches directly via Supabase browser client
+      const totalBatches = Math.ceil(trimmedRows.length / BATCH_SIZE)
+
+      for (let i = 0; i < trimmedRows.length; i += BATCH_SIZE) {
+        const batch = trimmedRows.slice(i, i + BATCH_SIZE).map((data, j) => ({
           dataset_id: datasetId,
           row_index: i + j,
           data,
@@ -152,7 +159,9 @@ export default function UploadFlow({ onComplete, onCancel }: Props) {
         setSaveProgress(Math.round(((batchIndex + 1) / totalBatches) * 100))
       }
 
-      onComplete(datasetId)
+      // 4. Go to cleaning step instead of completing immediately
+      setSavedDatasetId(datasetId)
+      setStep('cleaning')
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to save dataset')
       setStep('review')
@@ -196,6 +205,17 @@ export default function UploadFlow({ onComplete, onCancel }: Props) {
         <div className="text-3xl animate-spin inline-block">⚙</div>
         <p className="text-sm text-zinc-500">Analysing columns with AI…</p>
       </div>
+    )
+  }
+
+  if (step === 'cleaning' && savedDatasetId) {
+    return (
+      <CleaningStep
+        datasetId={savedDatasetId}
+        rows={rows}
+        columns={columns}
+        onComplete={() => onComplete(savedDatasetId)}
+      />
     )
   }
 

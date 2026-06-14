@@ -62,6 +62,7 @@ export default function AuthForm({ mode }: Props) {
             onChange={(e) => setEmail(e.target.value)}
             placeholder="you@example.com"
             className="w-full px-3 py-2 rounded-lg border border-zinc-300 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-transparent"
+            suppressHydrationWarning
           />
         </div>
 
@@ -78,6 +79,7 @@ export default function AuthForm({ mode }: Props) {
             onChange={(e) => setPassword(e.target.value)}
             placeholder="••••••••"
             className="w-full px-3 py-2 rounded-lg border border-zinc-300 text-sm focus:outline-none focus:ring-2 focus:ring-zinc-900 focus:border-transparent"
+            suppressHydrationWarning
           />
         </div>
 
