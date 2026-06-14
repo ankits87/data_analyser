@@ -15,8 +15,10 @@ export default function FeedbackButtons({ messageId }: Props) {
   async function handleFeedback(value: 1 | -1) {
     if (rating === value) return
     setRating(value)
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user) return
     await supabase.from('message_feedback').upsert(
-      { message_id: messageId, rating: value },
+      { message_id: messageId, user_id: user.id, rating: value },
       { onConflict: 'message_id,user_id' }
     )
     setSaved(true)
