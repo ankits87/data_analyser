@@ -1,4 +1,7 @@
-import alasql from 'alasql'
+import { Database } from 'duckdb-async'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
 import { createClient } from '@/lib/supabase/server'
 import { geminiFlash } from '@/lib/gemini'
 import type { ChatPayload, ColumnDefinition, ChartConfig } from '@/types'
@@ -46,8 +49,31 @@ function prepareRows(
   })
 }
 
-// alasql can't parse [ or ] inside backtick-quoted identifiers (e.g. `2010 [YR2010]`).
-// Strip "[...]" annotations directly from SQL identifiers and row keys — no column map needed.
+// Write rows as NDJSON to a temp file, load into DuckDB in-memory, run the query.
+// DuckDB auto-detects types from NDJSON, supports full SQL: CTEs, window functions, subqueries.
+async function runDuckDBQuery(
+  sql: string,
+  rows: Record<string, unknown>[]
+): Promise<Record<string, unknown>[]> {
+  const tmpFile = path.join(os.tmpdir(), `da_${Date.now()}_${Math.random().toString(36).slice(2)}.ndjson`)
+  const duckPath = tmpFile.replace(/\\/g, '/')
+  try {
+    fs.writeFileSync(tmpFile, rows.map(r => JSON.stringify(r)).join('\n'), 'utf8')
+    const db = await Database.create(':memory:')
+    const conn = await db.connect()
+    await conn.run(`CREATE TABLE data AS SELECT * FROM read_ndjson_auto('${duckPath}')`)
+    const result = await conn.all(sql)
+    await db.close()
+    // DuckDB returns COUNT/SUM results as BigInt — convert to Number for JSON serialization
+    return (result as Record<string, unknown>[]).map(row => {
+      const out: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(row)) out[k] = typeof v === 'bigint' ? Number(v) : v
+      return out
+    })
+  } finally {
+    try { fs.unlinkSync(tmpFile) } catch {}
+  }
+}
 
 function stripBracketAnnotation(name: string): string {
   return name.replace(/\s*\[.*?\]/g, '').trim()
@@ -67,54 +93,45 @@ function sanitizeRowKeys(rows: Record<string, unknown>[]): Record<string, unknow
   })
 }
 
-// Detect World Bank / wide-format data: 4+ columns whose names start with a 4-digit year.
-// Transforms: [{ Country, 2010: v1, 2011: v2 }] → [{ Country, Year: "2010", Value: v1 }, ...]
-// Empty-value rows are dropped naturally during the unpivot.
-function maybeUnpivot(rows: Record<string, unknown>[]): Record<string, unknown>[] {
+
+// For "combined X% of total" questions: sort rows by the numeric column DESC,
+// compute a running sum, and return only rows up to and including the one that
+// pushes the cumulative total past the threshold percentage.
+// Returns the original rows unchanged if the pattern doesn't apply.
+function maybeCumulativeFilter(
+  rows: Record<string, unknown>[],
+  question: string
+): Record<string, unknown>[] {
   if (rows.length === 0) return rows
+
+  // Only activate when the question mentions "combined" or "cumulative" with a percentage
+  const pctMatch = question.match(/(\d+(?:\.\d+)?)\s*%/)
+  const isCumulative = /combined|cumulative|together|top.*?\%|\%.*?top/i.test(question)
+  if (!pctMatch || !isCumulative) return rows
+
+  const threshold = parseFloat(pctMatch[1]) / 100
+
+  // Need exactly one label column and one numeric column
   const keys = Object.keys(rows[0])
-  const yearKeys = keys.filter(k => /^\d{4}/.test(k.trim()))
-  if (yearKeys.length < 4) return rows   // not wide format, return as-is
-  const dimKeys = keys.filter(k => !yearKeys.includes(k))
-  const long: Record<string, unknown>[] = []
-  for (const row of rows) {
-    for (const yk of yearKeys) {
-      const val = row[yk]
-      if (val === null || val === undefined || String(val).trim() === '') continue
-      const yearLabel = yk.match(/^(\d{4})/)?.[1] ?? yk
-      const entry: Record<string, unknown> = {}
-      for (const dk of dimKeys) entry[dk] = row[dk]
-      entry['Year'] = yearLabel
-      entry['Value'] = typeof val === 'number' ? val : Number(val)
-      long.push(entry)
-    }
+  if (keys.length !== 2) return rows
+  const numericKey = keys.find(k => rows.every(r => typeof r[k] === 'number' || (r[k] !== null && !isNaN(Number(r[k])))))
+  if (!numericKey) return rows
+
+  const total = rows.reduce((s, r) => s + Number(r[numericKey]), 0)
+  if (total === 0) return rows
+
+  const sorted = [...rows].sort((a, b) => Number(b[numericKey]) - Number(a[numericKey]))
+
+  let running = 0
+  const result: Record<string, unknown>[] = []
+  for (const row of sorted) {
+    running += Number(row[numericKey])
+    result.push(row)
+    if (running / total >= threshold) break
   }
-  return long.length > 0 ? long : rows
+  return result
 }
 
-// When long-format data has multiple entities (e.g. Brazil + Argentina), pivot to wide format
-// so the chart can render a separate series per entity instead of one merged line.
-// Input:  [{ "Country Name": "Brazil", Year: "2010", Value: 195e6 }, ...]
-// Output: [{ Year: "2010", Brazil: 195e6, Argentina: 40e6 }, ...]
-function maybePivotForChart(rows: Record<string, unknown>[]): Record<string, unknown>[] {
-  if (rows.length === 0) return rows
-  const keys = Object.keys(rows[0])
-  if (!keys.includes('Year') || !keys.includes('Value')) return rows
-  const dimKey = keys.find(k => k !== 'Year' && k !== 'Value')
-  if (!dimKey) return rows
-  const entities = [...new Set(rows.map(r => String(r[dimKey])))]
-  if (entities.length <= 1) return rows
-  const years = [...new Set(rows.map(r => String(r['Year'])))]
-    .sort((a, b) => Number(a) - Number(b))
-  return years.map(year => {
-    const entry: Record<string, unknown> = { Year: year }
-    for (const entity of entities) {
-      const match = rows.find(r => String(r['Year']) === year && String(r[dimKey]) === entity)
-      entry[entity] = match?.['Value'] ?? null
-    }
-    return entry
-  })
-}
 
 export async function POST(request: Request) {
   try {
@@ -179,7 +196,7 @@ export async function POST(request: Request) {
     ? `\nSample rows spread across the dataset (shows actual values — use for reference):\n${JSON.stringify(sampleRows, null, 2)}`
     : ''
 
-  const sqlSystemPrompt = `You are a SQL expert using alasql (in-memory JavaScript SQL engine).
+  const sqlSystemPrompt = `You are a SQL expert using DuckDB (full analytical SQL engine).
 Table name: data
 Schema:
 ${schemaLines}
@@ -195,26 +212,56 @@ Rules:
 - Backtick-quoting is REQUIRED for all column names — even simple ones
 - The table name is always "data"
 - Write only a SELECT query — never INSERT, UPDATE, DELETE
-- No CTEs (WITH clauses), no window functions, no table aliases (never use T1./T2. prefixes)
+- CTEs (WITH clauses), window functions (ROW_NUMBER, RANK, SUM OVER, etc.), subqueries, and table aliases are fully supported — use them freely for complex analysis
 - Avoid these reserved words as aliases: count, sum, avg, total, value, index — use cnt, amount, avg_val, grand_total, num instead
-- ALWAYS use LIKE with wildcards when filtering string columns on user-provided values: e.g. [Series Name] LIKE '%Population%', [Country Name] LIKE '%Argentina%'
+- ALWAYS use LIKE with wildcards when filtering string columns on user-provided values: e.g. \`Series Name\` LIKE '%Population%', \`Country Name\` LIKE '%Argentina%'
 - Only use exact = matching if the exact string is visible in the sample rows above
+- Wide-format data (columns named as years like "2010", "2011"...): use DuckDB UNPIVOT to convert to long format for trend/time-series questions. Example: UNPIVOT data ON "2010","2011","2012" INTO NAME year VALUE amount WHERE ...
+- Always structure output to be chart-ready: for time-series use (year, value) or (year, entity, value); for comparisons use (label, value); for rankings use (rank, label, value)
+- For "combined X% of total" or "cumulative" questions: return ALL rows with the label and numeric column ordered by value DESC — do NOT filter by percentage threshold. The system applies cumulative filtering automatically.
+- LIMIT: only add a LIMIT clause when the user explicitly specifies a number (e.g. "top 5", "show 3"). For "the most" or "highest" without a number, use LIMIT 10. Never use LIMIT 1.
+- ORDER BY: always add a secondary sort column to make results deterministic (e.g. ORDER BY cnt DESC, director_name ASC, actor_name ASC). This prevents ties from producing different results across queries.
+- When multiple columns represent the same logical entity split across slots (columns sharing a common base name with a numeric suffix or prefix, e.g. "actor_1_name"/"actor_2_name"/"actor_3_name", "genre_1"/"genre_2", "tag1"/"tag2"/"tag3"), always UNION ALL all of them into a single column before grouping or counting. Never query just one of those columns — always combine all variants. Example pattern: WITH combined AS (SELECT "other_col", "entity_col_1" AS entity FROM data UNION ALL SELECT "other_col", "entity_col_2" AS entity FROM data UNION ALL SELECT "other_col", "entity_col_3" AS entity FROM data) SELECT entity, "other_col", COUNT(*) AS cnt FROM combined WHERE entity IS NOT NULL AND entity != '' GROUP BY entity, "other_col" ORDER BY cnt DESC
 - Return ONLY the raw SQL — absolutely no other text before or after`
 
-  // For SQL generation history: pass only the insight text for model turns.
-  // Passing the raw SQL caused Gemini to echo "[SQL used: ...]" patterns back.
-  const geminiHistory = history.map(m => ({
-    role: m.role === 'user' ? 'user' as const : 'model' as const,
-    parts: [{ text: m.content }],
-  }))
+  // For SQL generation history: only include turns where the model produced real SQL.
+  // Non-SQL responses ("11", prose) confuse Gemini into answering directly instead
+  // of generating a query. We pair each valid SQL response with its user question.
+  const geminiHistory: { role: 'user' | 'model'; parts: [{ text: string }] }[] = []
+  for (let i = 0; i < history.length - 1; i++) {
+    const userMsg = history[i]
+    const assistantMsg = history[i + 1]
+    if (
+      userMsg?.role === 'user' &&
+      assistantMsg?.role === 'assistant' &&
+      assistantMsg.sql_query &&
+      /^\s*(SELECT|WITH)\b/i.test(assistantMsg.sql_query)
+    ) {
+      geminiHistory.push({ role: 'user', parts: [{ text: userMsg.content }] })
+      // Append a brief result summary as a SQL comment so follow-up queries can anchor
+      // to the exact values shown to the user instead of recalculating and hitting ties.
+      const resultSummary = assistantMsg.content
+        ? `\n-- Result shown to user: ${assistantMsg.content.slice(0, 300).replace(/\n/g, ' ')}`
+        : ''
+      geminiHistory.push({ role: 'model', parts: [{ text: assistantMsg.sql_query + resultSummary }] })
+      i++ // skip the assistant message on next iteration
+    }
+  }
 
   // Use generateContent with system prompt embedded as first user/model turn.
   // This avoids systemInstruction format differences across Gemini 2.x models.
+  // For cumulative percentage questions, override Gemini's instinct to use a subquery filter.
+  // Append an explicit instruction so it returns all rows sorted DESC instead.
+  const isCumulativePctQuery = /combined|cumulative|together/i.test(question) && /\d+\s*%/.test(question)
+  const questionForSQL = isCumulativePctQuery
+    ? `${question}\n\n[INSTRUCTION: This is a cumulative percentage query. Return ALL rows with just the entity label column and the numeric value column, sorted by the numeric value DESC. Do NOT add any WHERE clause filtering by the percentage — cumulative filtering is applied automatically after your SQL runs.]`
+    : question
+
   const sqlContents = [
     { role: 'user' as const, parts: [{ text: sqlSystemPrompt }] },
     { role: 'model' as const, parts: [{ text: 'Understood. I will return only raw SQL SELECT queries.' }] },
     ...geminiHistory,
-    { role: 'user' as const, parts: [{ text: question }] },
+    { role: 'user' as const, parts: [{ text: questionForSQL }] },
   ]
 
   let generatedSQL = ''
@@ -260,49 +307,46 @@ Rules:
   if (!looksLikeSQL) {
     naturalLanguageResponse = generatedSQL
   } else {
-    const { data: rowRecords } = await supabase
-      .from('dataset_rows')
-      .select('data')
-      .eq('dataset_id', dataset_id)
-      .order('row_index')
-      .limit(10000)
+    // Supabase PostgREST caps responses at 1000 rows by default — paginate to fetch all rows
+    const PAGE = 1000
+    const allRowRecords: { data: Record<string, unknown> }[] = []
+    let from = 0
+    while (true) {
+      const { data: page } = await supabase
+        .from('dataset_rows')
+        .select('data')
+        .eq('dataset_id', dataset_id)
+        .order('row_index')
+        .range(from, from + PAGE - 1)
+      if (!page || page.length === 0) break
+      allRowRecords.push(...(page as { data: Record<string, unknown> }[]))
+      if (page.length < PAGE) break
+      from += PAGE
+    }
+    const rowRecords = allRowRecords
 
-    const preparedRows = prepareRows(
-      (rowRecords ?? []).map(r => r.data as Record<string, unknown>),
-      columns
+    const flatRows = sanitizeRowKeys(
+      prepareRows(
+        (rowRecords ?? []).map(r => r.data as Record<string, unknown>),
+        columns
+      )
     )
 
-    const flatRows = sanitizeRowKeys(preparedRows)
-
-    // Normalize for alasql:
-    // 1. Replace "FROM data" with "FROM ?" (inline array syntax)
-    // 2. Strip AS aliases from ? placeholders — alasql doesn't support FROM ? AS T1
-    // 3. Strip table alias prefixes from column refs — T1.`col` → `col`
-    // 4. Strip "[YR...]" bracket annotations from identifiers
-    const normalizedSQL = sanitizeSQLIdentifiers(
-      generatedSQL
-        .replace(/\bFROM\s+data\b/gi, 'FROM ?')
-        .replace(/\bJOIN\s+data\b/gi, 'JOIN ?')
-        .replace(/(\bFROM\s+\?)\s+AS\s+\w+\b/gi, '$1')
-        .replace(/(\bJOIN\s+\?)\s+AS\s+\w+\b/gi, '$1')
-        .replace(/\b\w+\.(`[^`]+`)/g, '$1')
-    )
-
-    const placeholderCount = (normalizedSQL.match(/\bFROM\s+\?|\bJOIN\s+\?/gi) ?? []).length
-    const sqlParams = Array(Math.max(1, placeholderCount)).fill(flatRows)
+    // Strip "[YR...]" bracket annotations then convert backticks → double-quotes for DuckDB
+    const normalizedSQL = sanitizeSQLIdentifiers(generatedSQL)
+      .replace(/`([^`]+)`/g, '"$1"')
 
     try {
-      const rawResult: Record<string, unknown>[] = alasql(normalizedSQL, sqlParams)
-      // Drop fully-blank rows, then unpivot wide (year-column) data to long format
+      const rawResult = await runDuckDBQuery(normalizedSQL, flatRows)
       const nonBlank = rawResult.filter(row =>
         Object.values(row).some(v => v !== null && v !== undefined && String(v).trim() !== '')
       )
-      queryResult = maybePivotForChart(maybeUnpivot(nonBlank))
+      queryResult = maybeCumulativeFilter(nonBlank, question)
       console.log('[chat] SQL:', normalizedSQL)
       console.log('[chat] rows returned:', queryResult.length, '| sample:', JSON.stringify(queryResult[0] ?? null))
     } catch (err) {
       sqlError = err instanceof Error ? err.message : 'Unknown SQL error'
-      console.error('[chat] alasql error:', sqlError, '| SQL:', normalizedSQL)
+      console.error('[chat] duckdb error:', sqlError, '| SQL:', normalizedSQL)
     }
   }
 
@@ -373,6 +417,13 @@ Rules:
       console.log('[chat] chartConfig type:', chartConfig.type, '| data rows:', chartConfig.data?.length, '| cols:', columnCount, '| x_key:', chartConfig.x_key)
     } catch (err) {
       console.error('[chat] insight error:', err)
+      const detail = err instanceof Error ? err.message : String(err)
+      if (/quota|rate.?limit|resource.?exhausted|429/i.test(detail)) {
+        return Response.json({
+          error: 'AI quota exceeded. Please try again tomorrow or check your Gemini API plan.',
+          detail,
+        }, { status: 429 })
+      }
       insight = `Query returned ${queryResult.length} row${queryResult.length !== 1 ? 's' : ''}.`
       const firstKey = chartRows[0] ? Object.keys(chartRows[0])[0] : ''
       chartConfig = {

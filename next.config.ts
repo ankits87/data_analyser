@@ -7,7 +7,7 @@ const nextConfig: NextConfig = {
   // With serverExternalPackages, Node.js loads it natively at runtime where
   // the react-native branch is guarded by `navigator.product === 'ReactNative'`
   // and never executes.
-  serverExternalPackages: ["alasql"],
+  serverExternalPackages: ["alasql", "duckdb", "duckdb-async"],
 };
 
 export default nextConfig;
